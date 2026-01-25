@@ -47,10 +47,15 @@ def init_db():
     c.commit()
     c.close()
 
-def looks_like_ad(text):
+def looks_like_ad(text: str) -> bool:
     t = text.lower()
-    has_price = bool(re.search(r"(\\d+[\\s\\d]{5,}|\\d+(\\.\\d+)?\\s*(м|m)|\\d+\\s*(к|k))", t))
-    has_year = bool(re.search(r"\\b(20[0-2]\\d|199\\d)\\b", t))
+
+    # цена: 2100000 / 2 100 000 / 2.1м / 500к
+    has_price = bool(re.search(r"(\d[\d\s]{5,}|\d+(\.\d+)?\s*[мm]|\d+\s*[кk])", t))
+
+    # год: 1990-2029 (можешь расширить)
+    has_year = bool(re.search(r"\b(20[0-2]\d|199\d)\b", t))
+
     return has_price and has_year
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
