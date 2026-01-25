@@ -15,6 +15,16 @@ DB_PATH = "db.sqlite3"
 
 dp = Dispatcher()
 
+@dp.message(F.text.startswith("/start"))
+async def start_cmd(m: Message):
+    await m.reply(
+        "🤖 Бот запущен.\n\n"
+        "📌 Я работаю в группе:\n"
+        "— сохраняю объявления\n"
+        "— /search BMW\n"
+        "— /sold (ответом на объявление)"
+    )
+
 def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
