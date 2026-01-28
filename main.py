@@ -131,12 +131,26 @@ async def send_results(message: Message, rows):
 
     for row in rows:
         lid, text, year, price, sold = row
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="✅ Продано" if not sold else "☑️ Уже SOLD",
-                callback_data=f"sold:{lid}"
-            )]
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Продано" if not sold else "☑️ Уже SOLD",
+                        callback_data=f"sold:{lid}"
+                    )
+                ]
+            ]
         )
+
+        price_str = f"{int(price):,}".replace(",", " ") if price else "—"
+        year_str = str(year) if year else "—"
+
+        await message.answer(
+            f"{'✅ SOLD' if sold else '🟢'} | {year_str} | {price_str}\n{text}",
+            reply_markup=kb
+        )
+
         await message.answer(
             f"{'✅ SOLD' if sold else '🟢'} | {year} | {price:,}\n{text}",
             reply_markup=kb
