@@ -73,8 +73,30 @@ CREATE TABLE IF NOT EXISTS listings (
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # базовая таблица (если БД новая)
         await db.execute(CREATE_SQL)
+
+        # миграция: если таблица старая — добавляем недостающие колонки
+        cur = await db.execute("PRAGMA table_info(listings)")
+        cols = {row[1] for row in await cur.fetchall()}
+
+        if "text_hash" not in cols:
+            await db.execute("ALTER TABLE listings ADD COLUMN text_hash TEXT")
+        if "sold" not in cols:
+            await db.execute("ALTER TABLE listings ADD COLUMN sold INTEGER DEFAULT 0")
+        if "created_at" not in cols:
+            await db.execute("ALTER TABLE listings ADD COLUMN created_at TEXT")
+
         await db.commit()
+
+        # (не обязательно, но полезно) заполнить text_hash для старых записей
+        cur2 = await db.execute("SELECT id, text FROM listings WHERE text_hash IS NULL OR text_hash=''")
+        rows = await cur2.fetchall()
+        for lid, text in rows:
+            th = text_hash(text or "")
+            await db.execute("UPDATE listings SET text_hash=? WHERE id=?", (th, lid))
+        await db.commit()
+
 
 async def is_duplicate(th: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
