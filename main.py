@@ -77,13 +77,13 @@ async def init_db():
         await db.commit()
 
 async def is_duplicate(th: str) -> bool:
-    since = (datetime.utcnow() - timedelta(minutes=ANTI_DUP_MINUTES)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT 1 FROM listings WHERE text_hash=? AND created_at>=? LIMIT 1",
-            (th, since)
+            "SELECT 1 FROM listings WHERE text_hash=? LIMIT 1",
+            (th,)
         )
         return await cur.fetchone() is not None
+
 
 async def add_listing(chat_id, msg_id, text, year, price):
     th = text_hash(text)
