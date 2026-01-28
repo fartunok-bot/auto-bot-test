@@ -22,7 +22,7 @@ DB_PATH = "db.sqlite3"
 if not BOT_TOKEN:
     raise RuntimeError("ENV BOT_TOKEN is required")
 
-TARGET_CHAT_ID = None
+TARGET_CHAT_ID: int | None = None
 if MODE == "POSTER":
     if not TARGET_CHAT_ID_RAW:
         raise RuntimeError("MODE=POSTER requires ENV TARGET_CHAT_ID")
@@ -30,6 +30,9 @@ if MODE == "POSTER":
         TARGET_CHAT_ID = int(TARGET_CHAT_ID_RAW)
     except ValueError:
         raise RuntimeError("TARGET_CHAT_ID must be integer (e.g. -1001234567890)")
+
+if MODE not in ("CATALOG", "POSTER"):
+    raise RuntimeError("MODE must be CATALOG or POSTER")
 
 
 # -------------------- LOGGING --------------------
@@ -42,29 +45,24 @@ log = logging.getLogger("auto_catalog")
 
 # -------------------- PARSING --------------------
 YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
-# Цена: 2100000 или 2 100 000 или 2.100.000
 PRICE_RE = re.compile(r"\b\d{1,3}(?:[ .]\d{3})+\b|\b\d{6,}\b")
 
-def normalize_price(s: str) -> int | None:
-    # вытащим первую подходящую "цену" и приведем к int
-    m = PRICE_RE.search(s)
+
+def normalize_price(text: str) -> int | None:
+    m = PRICE_RE.search(text)
     if not m:
         return None
-    raw = m.group(0)
-    digits = re.sub(r"\D", "", raw)
+    digits = re.sub(r"\D", "", m.group(0))
     if not digits:
         return None
-    # отсечём слишком маленькие/странные
-    try:
-        val = int(digits)
-        if val < 50000:  # меньше 50к почти точно не цена авто
-            return None
-        return val
-    except ValueError:
+    val = int(digits)
+    if val < 50_000:  # отсекаем мусор
         return None
+    return val
 
-def extract_year(s: str) -> int | None:
-    m = YEAR_RE.search(s)
+
+def extract_year(text: str) -> int | None:
+    m = YEAR_RE.search(text)
     if not m:
         return None
     y = int(m.group(1))
@@ -72,9 +70,9 @@ def extract_year(s: str) -> int | None:
         return y
     return None
 
-def looks_like_listing(text: str) -> tuple[bool, int | None, int | None]:
+
+def is_listing(text: str) -> tuple[bool, int | None, int | None]:
     """
-    Возвращает (is_listing, year, price)
     Объявление = есть ГОД и ЦЕНА.
     """
     year = extract_year(text)
@@ -103,13 +101,21 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 """
 
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(CREATE_SQL)
         await db.commit()
 
-async def save_listing(src_chat_id: int, src_message_id: int, author_id: int | None,
-                       text: str, year: int | None, price: int | None) -> bool:
+
+async def save_listing_to_db(
+    src_chat_id: int,
+    src_message_id: int,
+    author_id: int | None,
+    text: str,
+    year: int | None,
+    price: int | None,
+) -> bool:
     """
     True если вставили новое, False если уже было.
     """
@@ -127,28 +133,8 @@ async def save_listing(src_chat_id: int, src_message_id: int, author_id: int | N
         except aiosqlite.IntegrityError:
             return False
 
-async def mark_sold(src_chat_id: int, src_message_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE listings SET sold=1 WHERE src_chat_id=? AND src_message_id=?",
-            (src_chat_id, src_message_id),
-        )
-        await db.commit()
-        return cur.rowcount > 0
 
-async def set_posted(src_chat_id: int, src_message_id: int, target_chat_id: int, target_message_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            UPDATE listings
-            SET posted=1, target_chat_id=?, target_message_id=?
-            WHERE src_chat_id=? AND src_message_id=?
-            """,
-            (target_chat_id, target_message_id, src_chat_id, src_message_id),
-        )
-        await db.commit()
-
-async def search_listings(query: str, limit: int = 5):
+async def search_db(query: str, limit: int = 5):
     q = f"%{query.strip()}%"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -164,34 +150,63 @@ async def search_listings(query: str, limit: int = 5):
         return await cur.fetchall()
 
 
+async def mark_sold_db(src_chat_id: int, src_message_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE listings SET sold=1 WHERE src_chat_id=? AND src_message_id=?",
+            (src_chat_id, src_message_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def set_posted_db(src_chat_id: int, src_message_id: int, target_chat_id: int, target_message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE listings
+            SET posted=1, target_chat_id=?, target_message_id=?
+            WHERE src_chat_id=? AND src_message_id=?
+            """,
+            (target_chat_id, target_message_id, src_chat_id, src_message_id),
+        )
+        await db.commit()
+
+
 # -------------------- BOT --------------------
 dp = Dispatcher()
 
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    # /start — только в личке, чтобы не флудить в группе
+    if message.chat.type != "private":
+        return
+
     await message.answer(
         "✅ AUTO CATALOG запущен.\n\n"
         "Команды:\n"
         "/search <запрос> — последние 5 совпадений\n"
-        "/sold — ответом на объявление пометить как продано\n\n"
+        "/sold — ответом на объявление пометить SOLD\n\n"
         f"MODE: {MODE}"
     )
 
+
 @dp.message(Command("search"))
 async def cmd_search(message: Message):
-    parts = message.text.split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Напиши так: /search BMW")
+        await message.answer("Пиши так: /search BMW")
         return
 
     query = parts[1].strip()
-    rows = await search_listings(query, limit=5)
+    rows = await search_db(query, limit=5)
 
     if not rows:
         await message.answer("Ничего не нашёл 😕")
         return
 
-    lines = []
+    out = []
     for (chat_id, msg_id, text, year, price, sold, created_at) in rows:
         sold_mark = "✅ SOLD" if sold else "🟢"
         price_str = f"{price:,}".replace(",", " ") if price else "—"
@@ -199,13 +214,15 @@ async def cmd_search(message: Message):
         snippet = text.strip().replace("\n", " ")
         if len(snippet) > 160:
             snippet = snippet[:160] + "…"
-        lines.append(
+
+        out.append(
             f"{sold_mark} | {year_str} | {price_str}\n"
             f"{snippet}\n"
             f"(src: {chat_id}, msg: {msg_id})"
         )
 
-    await message.answer("\n\n".join(lines))
+    await message.answer("\n\n".join(out))
+
 
 @dp.message(Command("sold"))
 async def cmd_sold(message: Message):
@@ -216,21 +233,22 @@ async def cmd_sold(message: Message):
     src_chat_id = message.chat.id
     src_message_id = message.reply_to_message.message_id
 
-    ok = await mark_sold(src_chat_id, src_message_id)
+    ok = await mark_sold_db(src_chat_id, src_message_id)
     await message.answer("✅ Пометил как SOLD" if ok else "Не нашёл это объявление в базе 😕")
 
+
+# ВАЖНО: Этот хендлер НЕ отвечает в чат вообще. Только сохраняет (и копирует в POSTER).
 @dp.message(F.text)
 async def catch_listings(message: Message, bot: Bot):
-    # Сохраняем только в группах/супергруппах (не обязательно, но логично)
     if message.chat.type not in ("group", "supergroup"):
         return
 
     text = message.text or ""
-    is_listing, year, price = looks_like_listing(text)
-    if not is_listing:
+    ok, year, price = is_listing(text)
+    if not ok:
         return
 
-    inserted = await save_listing(
+    inserted = await save_listing_to_db(
         src_chat_id=message.chat.id,
         src_message_id=message.message_id,
         author_id=message.from_user.id if message.from_user else None,
@@ -240,11 +258,10 @@ async def catch_listings(message: Message, bot: Bot):
     )
 
     if not inserted:
-        return  # уже было
+        return
 
     log.info(f"Saved listing: chat={message.chat.id} msg={message.message_id} year={year} price={price}")
 
-    # POSTER: копируем сообщение в канал/чат каталога
     if MODE == "POSTER" and TARGET_CHAT_ID is not None:
         try:
             copied = await bot.copy_message(
@@ -252,7 +269,7 @@ async def catch_listings(message: Message, bot: Bot):
                 from_chat_id=message.chat.id,
                 message_id=message.message_id
             )
-            await set_posted(message.chat.id, message.message_id, TARGET_CHAT_ID, copied.message_id)
+            await set_posted_db(message.chat.id, message.message_id, TARGET_CHAT_ID, copied.message_id)
             log.info(f"Posted to target: target_chat={TARGET_CHAT_ID} target_msg={copied.message_id}")
         except Exception as e:
             log.exception(f"Failed to post to TARGET_CHAT_ID: {e}")
@@ -277,11 +294,11 @@ async def main():
     await init_db()
 
     bot = Bot(token=BOT_TOKEN)
-    await health_server()  # чтобы Render Web Service не ругался
+    await health_server()
 
     log.info("Bot starting polling...")
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-
