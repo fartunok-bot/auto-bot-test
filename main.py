@@ -1,11 +1,10 @@
-# ===== AUTO CATALOG v2 STEP2 (POSTER FINAL) =====
 import os
 import re
 import asyncio
 import logging
 import hashlib
-from datetime import datetime
-from typing import Optional, Tuple, List
+from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -20,14 +19,14 @@ from aiohttp import web
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MODE = os.getenv("MODE", "CATALOG").upper()  # CATALOG or POSTER
+MODE = os.getenv("MODE", "CATALOG").upper()          # CATALOG | POSTER
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = "db.sqlite3"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required")
-if MODE == "POSTER" and not TARGET_CHAT_ID:
+if MODE == "POSTER" and TARGET_CHAT_ID == 0:
     raise RuntimeError("TARGET_CHAT_ID required in POSTER mode")
 
 # ---------------- LOG ----------------
@@ -53,8 +52,8 @@ def parse(text: str) -> Tuple[bool, Optional[int], Optional[int]]:
 def h(text: str) -> str:
     return hashlib.md5(text.lower().encode("utf-8")).hexdigest()
 
-def link(chat_id: int, msg_id: int) -> str:
-    # Works for private supergroups/channels: t.me/c/<internal_id>/<msg_id>
+def tg_link(chat_id: int, msg_id: int) -> str:
+    # For supergroups/channels: https://t.me/c/<internal_id>/<msg_id>
     return f"https://t.me/c/{str(chat_id).replace('-100','')}/{msg_id}"
 
 # ---------------- DB ----------------
@@ -78,23 +77,27 @@ async def init_db():
         await db.execute(CREATE_SQL)
         await db.commit()
 
-async def exists(hash_: str) -> bool:
+async def exists_by_hash(hash_: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT 1 FROM listings WHERE hash=? LIMIT 1", (hash_,))
         return await cur.fetchone() is not None
 
-async def add_listing(src_chat: int, src_msg: int, text: str, year: int, price: int, cat_msg: Optional[int]) -> int:
-    """Insert and return listing id."""
+async def add_listing(src_chat: int, src_msg: int, text: str, year: int, price: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "INSERT INTO listings (src_chat, src_msg, text, hash, year, price, sold, created, cat_msg) "
-            "VALUES (?,?,?,?,?,?,0,?,?)",
-            (src_chat, src_msg, text, h(text), year, price, datetime.utcnow().isoformat(), cat_msg),
+            "VALUES (?,?,?,?,?,?,0,?,NULL)",
+            (src_chat, src_msg, text, h(text), year, price, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         return cur.lastrowid
 
-async def mark_sold_db(lid: int):
+async def set_cat_msg(lid: int, cat_msg: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE listings SET cat_msg=? WHERE id=?", (cat_msg, lid))
+        await db.commit()
+
+async def mark_sold(lid: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE listings SET sold=1 WHERE id=?", (lid,))
         await db.commit()
@@ -102,7 +105,7 @@ async def mark_sold_db(lid: int):
 async def search_db(q: str, limit: int = 5):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, text, year, price, sold FROM listings "
+            "SELECT id, text, year, price FROM listings "
             "WHERE sold=0 AND LOWER(text) LIKE ? ORDER BY id DESC LIMIT ?",
             (f"%{q.lower()}%", limit),
         )
@@ -111,7 +114,7 @@ async def search_db(q: str, limit: int = 5):
 async def last_db(limit: int = 5):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, text, year, price, sold FROM listings "
+            "SELECT id, text, year, price FROM listings "
             "WHERE sold=0 ORDER BY id DESC LIMIT ?",
             (limit,),
         )
@@ -120,12 +123,9 @@ async def last_db(limit: int = 5):
 # ---------------- BOT ----------------
 dp = Dispatcher()
 
-@dp.message(F.text | F.caption)
+# 1) ГРУППЫ: ловим объявления (НЕ отвечаем)
+@dp.message((F.text | F.caption) & F.chat.type.in_({"group", "supergroup"}))
 async def catch_group(msg: Message):
-    # We only index from groups/supergroups (as you intended)
-    if msg.chat.type not in ("group", "supergroup"):
-        return
-
     text = normalize(msg.text or msg.caption or "")
     if not text:
         return
@@ -135,53 +135,36 @@ async def catch_group(msg: Message):
         return
 
     hash_ = h(text)
-    if await exists(hash_):
+    if await exists_by_hash(hash_):
         return
 
-    cat_msg_id: Optional[int] = None
-    listing_id: Optional[int] = None
+    lid = await add_listing(msg.chat.id, msg.message_id, text, year, price)
+    log.info("Indexed listing id=%s from chat=%s msg=%s", lid, msg.chat.id, msg.message_id)
 
-    # First, create the DB record (we want id for SOLD callback)
-    listing_id = await add_listing(msg.chat.id, msg.message_id, text, year, price, None)
+    if MODE != "POSTER":
+        return
 
-    if MODE == "POSTER":
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📍 Источник", url=link(msg.chat.id, msg.message_id)),
-            InlineKeyboardButton(text="✅ SOLD", callback_data=f"sold:{listing_id}"),
-        ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📍 Источник", url=tg_link(msg.chat.id, msg.message_id)),
+        InlineKeyboardButton(text="✅ SOLD", callback_data=f"sold:{lid}")
+    ]])
 
-        caption = f"{year} | {price}\n{text}"
+    caption = f"{year} | {price}\n{text}"
 
-        if msg.photo:
-            sent = await msg.bot.send_photo(
-                TARGET_CHAT_ID,
-                msg.photo[-1].file_id,
-                caption=caption,
-                reply_markup=kb,
-            )
-        elif msg.video:
-            sent = await msg.bot.send_video(
-                TARGET_CHAT_ID,
-                msg.video.file_id,
-                caption=caption,
-                reply_markup=kb,
-            )
-        else:
-            sent = await msg.bot.send_message(
-                TARGET_CHAT_ID,
-                caption,
-                reply_markup=kb,
-            )
+    if msg.photo:
+        sent = await msg.bot.send_photo(
+            TARGET_CHAT_ID, msg.photo[-1].file_id, caption=caption, reply_markup=kb
+        )
+    elif msg.video:
+        sent = await msg.bot.send_video(
+            TARGET_CHAT_ID, msg.video.file_id, caption=caption, reply_markup=kb
+        )
+    else:
+        sent = await msg.bot.send_message(TARGET_CHAT_ID, caption, reply_markup=kb)
 
-        cat_msg_id = sent.message_id
+    await set_cat_msg(lid, sent.message_id)
 
-        # Update cat_msg in DB for this listing
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE listings SET cat_msg=? WHERE id=?", (cat_msg_id, listing_id))
-            await db.commit()
-
-    log.info("Indexed listing id=%s from chat=%s msg=%s", listing_id, msg.chat.id, msg.message_id)
-
+# 2) CALLBACK SOLD
 @dp.callback_query(F.data.startswith("sold:"))
 async def sold_cb(call: CallbackQuery):
     try:
@@ -190,19 +173,18 @@ async def sold_cb(call: CallbackQuery):
         await call.answer("Ошибка SOLD", show_alert=True)
         return
 
-    await mark_sold_db(lid)
-
-    # Replace keyboard with only the source button + SOLD label
-    # (we can't always recover source url from message, so just remove buttons)
+    await mark_sold(lid)
     await call.message.edit_reply_markup(reply_markup=None)
     await call.answer("Помечено как SOLD ✅")
 
+# 3) ЛИЧКА: /start
 @dp.message(Command("start"))
 async def start(msg: Message):
     if msg.chat.type != "private":
         return
     await msg.answer("Пиши запрос: bmw / camry / 2019 / 2350000\n/last — последние")
 
+# 4) ЛИЧКА: /last
 @dp.message(Command("last"))
 async def last_cmd(msg: Message):
     if msg.chat.type != "private":
@@ -211,13 +193,12 @@ async def last_cmd(msg: Message):
     if not rows:
         await msg.answer("Пока пусто 😕")
         return
-    for _, text, year, price, _ in rows:
+    for _, text, year, price in rows:
         await msg.answer(f"{year} | {price}\n{text}")
 
-@dp.message(F.text)
+# 5) ЛИЧКА: поиск (не ловим команды)
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def search(msg: Message):
-    if msg.chat.type != "private":
-        return
     q = msg.text.strip()
     if not q:
         return
@@ -225,11 +206,11 @@ async def search(msg: Message):
     if not rows:
         await msg.answer("Ничего не нашёл 😕")
         return
-    for _, text, year, price, _ in rows:
+    for _, text, year, price in rows:
         await msg.answer(f"{year} | {price}\n{text}")
 
 # ---------------- HEALTH ----------------
-async def health():
+async def health_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.json_response({"ok": True}))
     runner = web.AppRunner(app)
@@ -239,9 +220,13 @@ async def health():
 
 async def main():
     await init_db()
-    asyncio.create_task(health())
+    asyncio.create_task(health_server())
+
     bot = Bot(BOT_TOKEN)
-    # allowed_updates makes polling more reliable for different update types
+
+    # важно: убрать webhook, чтобы не было TelegramConflictError
+    await bot.delete_webhook(drop_pending_updates=True)
+
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
