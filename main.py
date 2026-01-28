@@ -1,10 +1,11 @@
-# ===== AUTO CATALOG v2 (STEP 1) - FIXED =====
+# ===== AUTO CATALOG v2 (STEP1 + PLUS) =====
 import os
 import re
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional, Tuple, List
+import hashlib
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -14,21 +15,24 @@ from aiohttp import web
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MODE = os.getenv("MODE", "CATALOG").strip().upper()
 PORT = int(os.getenv("PORT", "10000"))
-
 DB_PATH = "db.sqlite3"
+
+ANTI_DUP_MINUTES = 30  # антидубликаты
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required")
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("auto_catalog_v2")
+log = logging.getLogger("auto_catalog")
 
 # ---------------- PARSING ----------------
 YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
-PRICE_RE = re.compile(r"\b\d{1,3}(?:[ .]\d{3})+\b|\b\d{6,}\b")
+PRICE_RE = re.compile(r"\b\d{1,3}(?:[\s.\u00A0]\d{3})+\b|\b\d{6,}\b")
+
+def normalize_text(text: str) -> str:
+    return text.replace("\u00A0", " ").strip()
 
 def parse_listing(text: str) -> Tuple[bool, Optional[int], Optional[int]]:
     year = None
@@ -47,7 +51,10 @@ def parse_listing(text: str) -> Tuple[bool, Optional[int], Optional[int]]:
 def format_price(price: Optional[int]) -> str:
     if not price:
         return "—"
-    return f"{int(price):,}".replace(",", " ")
+    return f"{price:,}".replace(",", " ")
+
+def text_hash(text: str) -> str:
+    return hashlib.md5(text.lower().encode()).hexdigest()
 
 # ---------------- DB ----------------
 CREATE_SQL = """
@@ -56,6 +63,7 @@ CREATE TABLE IF NOT EXISTS listings (
     chat_id INTEGER,
     msg_id INTEGER,
     text TEXT,
+    text_hash TEXT,
     year INTEGER,
     price INTEGER,
     sold INTEGER DEFAULT 0,
@@ -68,37 +76,51 @@ async def init_db():
         await db.execute(CREATE_SQL)
         await db.commit()
 
-async def add_listing(chat_id: int, msg_id: int, text: str, year: int, price: int):
+async def is_duplicate(th: str) -> bool:
+    since = (datetime.utcnow() - timedelta(minutes=ANTI_DUP_MINUTES)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        # ВАЖНО: тут было неверное количество колонок
+        cur = await db.execute(
+            "SELECT 1 FROM listings WHERE text_hash=? AND created_at>=? LIMIT 1",
+            (th, since)
+        )
+        return await cur.fetchone() is not None
+
+async def add_listing(chat_id, msg_id, text, year, price):
+    th = text_hash(text)
+    if await is_duplicate(th):
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO listings (chat_id,msg_id,text,year,price,sold,created_at) VALUES (?,?,?,?,?,?,?)",
-            (chat_id, msg_id, text, year, price, 0, datetime.utcnow().isoformat())
+            "INSERT INTO listings (chat_id,msg_id,text,text_hash,year,price,sold,created_at) "
+            "VALUES (?,?,?,?,?,?,0,?)",
+            (chat_id, msg_id, text, th, year, price, datetime.utcnow().isoformat())
         )
         await db.commit()
 
-async def search_db(q: str, limit: int = 5):
-    q = (q or "").strip()
+async def search_db(q: str, limit=5):
+    q = q.lower()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id,chat_id,msg_id,text,year,price,sold FROM listings "
-            "WHERE text LIKE ? ORDER BY id DESC LIMIT ?",
+            "WHERE sold=0 AND LOWER(text) LIKE ? "
+            "ORDER BY id DESC LIMIT ?",
             (f"%{q}%", limit)
         )
         return await cur.fetchall()
 
-async def last_db(limit: int = 5):
+async def last_db(limit=5):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id,chat_id,msg_id,text,year,price,sold FROM listings "
-            "ORDER BY id DESC LIMIT ?",
+            "WHERE sold=0 ORDER BY id DESC LIMIT ?",
             (limit,)
         )
         return await cur.fetchall()
 
-async def mark_sold(listing_id: int):
+async def mark_sold(lid: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE listings SET sold=1 WHERE id=?", (listing_id,))
+        await db.execute("UPDATE listings SET sold=1 WHERE id=?", (lid,))
         await db.commit()
 
 # ---------------- BOT ----------------
@@ -112,100 +134,73 @@ async def send_results(message: Message, rows, title: Optional[str] = None):
     if title:
         await message.answer(title)
 
-    for row in rows:
-        lid, chat_id, msg_id, text, year, price, sold = row
-
-        sold_int = int(sold or 0)
-        prefix = "✅ SOLD" if sold_int else "🟢"
-
-        kb = None
-        if not sold_int:
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Продано", callback_data=f"sold:{lid}")]
+    for lid, chat_id, msg_id, text, year, price, sold in rows:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📍 Открыть объявление",
+                        url=f"https://t.me/c/{str(chat_id).replace('-100','')}/{msg_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="✅ Продано",
+                        callback_data=f"sold:{lid}"
+                    )
                 ]
-            )
+            ]
+        )
 
         await message.answer(
-            f"{prefix} | {year or '—'} | {format_price(price)}\n{text}\n\nsrc: {chat_id}:{msg_id}",
+            f"🟢 | {year} | {format_price(price)}\n{text}",
             reply_markup=kb
         )
 
 @dp.message(Command("start"))
-async def start(message: Message):
+async def start_cmd(message: Message):
     if message.chat.type != "private":
         return
     await message.answer(
-        "✅ AUTO CATALOG v2\n\n"
-        "Просто напиши запрос (без команд):\n"
-        "bmw / camry / 2015 / 2350000\n\n"
-        "Команды:\n"
-        "/last — последние 5"
+        "AUTO CATALOG ✅\n\n"
+        "Просто напиши запрос:\n"
+        "bmw / camry / 2019 / 2350000\n\n"
+        "/last — последние объявления"
     )
 
 @dp.message(Command("last"))
 async def last_cmd(message: Message):
     if message.chat.type != "private":
         return
-    rows = await last_db(limit=5)
-    await send_results(message, rows, title="Последние объявления:")
-
-@dp.message(Command("search"))
-async def search_cmd(message: Message):
-    if message.chat.type != "private":
-        return
-    q = message.text.replace("/search", "").strip()
-    rows = await search_db(q, limit=5)
-    await send_results(message, rows, title=f"Поиск: {q}")
+    rows = await last_db()
+    await send_results(message, rows, "Последние объявления:")
 
 @dp.message(F.text)
 async def smart_search(message: Message):
-    # Поиск без команд — только в ЛС
     if message.chat.type != "private":
         return
-
-    q = (message.text or "").strip()
+    q = message.text.strip()
     if not q or q.startswith("/"):
         return
-
-    rows = await search_db(q, limit=5)
-    await send_results(message, rows, title=f"Поиск: {q}")
+    rows = await search_db(q)
+    await send_results(message, rows, f"Поиск: {q}")
 
 @dp.callback_query(F.data.startswith("sold:"))
 async def sold_cb(call: CallbackQuery):
-    try:
-        lid = int(call.data.split(":")[1])
-    except Exception:
-        await call.answer("Ошибка", show_alert=True)
-        return
-
+    lid = int(call.data.split(":")[1])
     await mark_sold(lid)
     await call.answer("Пометил как SOLD ✅")
-    # убираем кнопку
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await call.message.edit_reply_markup()
 
 @dp.message(F.text | F.caption)
 async def catch_group(message: Message):
-    # В группе молчим, только сохраняем
     if message.chat.type not in ("group", "supergroup"):
         return
 
-    text = (message.text or message.caption or "").strip()
-    if not text:
-        return
-
+    text = normalize_text(message.text or message.caption or "")
     ok, year, price = parse_listing(text)
     if not ok:
         return
 
-    try:
-        await add_listing(message.chat.id, message.message_id, text, year, price)
-    except Exception as e:
-        log.exception("DB insert failed: %s", e)
-        return
+    await add_listing(message.chat.id, message.message_id, text, year, price)
 
 # ---------------- HEALTH ----------------
 async def health_server():
