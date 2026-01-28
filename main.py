@@ -15,8 +15,10 @@ DB_PATH = "db.sqlite3"
 
 dp = Dispatcher()
 
-@dp.message(F.text.startswith("/start"))
-async def start_cmd(m: Message):
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def catalog_listener(m: Message):
+    await m.reply("👀 Я вижу сообщение в группе")
+
     await m.reply(
         "🤖 Бот запущен.\n\n"
         "📌 Я работаю в группе:\n"
