@@ -191,9 +191,11 @@ async def health_server():
     await site.start()
 
 async def main():
-    await init_db()
-    bot = Bot(BOT_TOKEN)
-    await health_server()
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+
+    dp.include_router(router)
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
